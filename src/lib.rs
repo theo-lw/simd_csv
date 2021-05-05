@@ -37,7 +37,7 @@ pub mod simd_csv {
     }
 
     #[inline(always)]
-    fn find_quoted_regions(csv_slice: __m256i, in_quoted_region: i32) -> (i32, i32) {
+    fn find_quoted_regions(csv_slice: __m256i, in_quoted_region: i32) -> (i32, i32, i32) {
         let csv_quotes = get_char_mask(csv_slice, QUOTE);
         unsafe {
             let all_ones = _mm_set1_epi8(-1);
@@ -48,7 +48,7 @@ pub mod simd_csv {
             ));
             let quoted_region_with_quotes = quoted_region | csv_quotes;
             let end_in_quoted_region = get_last_bit(quoted_region);
-            (quoted_region_with_quotes, end_in_quoted_region)
+            (quoted_region_with_quotes, csv_quotes, end_in_quoted_region)
         }
     }
 
@@ -85,12 +85,6 @@ pub mod simd_csv {
             ((quoted_regions << 1) | (quoted_regions >> 1)) & !quoted_regions;
         let all_crs_followed_by_lfs = (in_crlf == lfs & 1) && is_bitset_a_subset(crs << 1, lfs);
         let all_lfs_preceeded_by_crs = is_bitset_a_subset(lfs >> 1, crs);
-        dbg!(
-            all_lfs_preceeded_by_crs,
-            all_crs_followed_by_lfs,
-            prev_quoted_region_ended,
-            starting_quoted_region_preceeded_by_delim
-        );
         !(prev_quoted_region_ended
             && starting_quoted_region_preceeded_by_delim
             // check that spots left & right of each quoted region are occupied by delims / crlfs
@@ -101,6 +95,7 @@ pub mod simd_csv {
 
     #[derive(Debug)]
     pub enum ParseError {
+        InconsistentColumnCount,
         MissingQuotes,
     }
 
@@ -119,7 +114,22 @@ pub mod simd_csv {
     const CARRIAGE_RETURN: u8 = b'\r';
     const LINE_FEED: u8 = b'\n';
 
-    pub fn find_delim_indices(csv: &[u8], delim: u8) -> Result<Vec<usize>, ParseError> {
+    #[derive(Debug, PartialEq)]
+    pub struct Token {
+        pub pos: usize,
+        pub quotes_before: usize,
+        pub token_type: TokenType,
+    }
+
+    #[derive(Debug, PartialEq)]
+    pub enum TokenType {
+        Delim,
+        CarriageReturn,
+        LineFeed,
+        End,
+    }
+
+    pub fn decode_csv_structure(csv: &[u8], delim: u8) -> Result<Vec<Token>, ParseError> {
         const STEP: usize = 256 / 8;
         let mut result = Vec::new();
         let mut csv_idx = 0;
@@ -128,22 +138,22 @@ pub mod simd_csv {
         let mut ended_delim: bool = true; // if the last SIMD vector ended with BOF/newline/comma
         let mut ended_quoted_region: bool = false; // if the last SIMD vector ended with the ending of a quoted region
         let mut parse_error: bool = false;
+        let mut num_carried_quotes = 0; // quotes at the end of the previous SIMD vector
         unsafe {
             while csv_idx + STEP <= csv.len() {
                 #[allow(clippy::cast_ptr_alignment)]
                 // Intel's documentation says that unaligned pointers are fine here
                 let csv_slice = _mm256_loadu_si256(csv[csv_idx..].as_ptr() as *const __m256i);
-                let (quoted_region, end_in_quoted_region) =
+                let (quoted_region, mut quotes, end_in_quoted_region) =
                     find_quoted_regions(csv_slice, in_quoted_region);
-                let crs = get_char_mask(csv_slice, CARRIAGE_RETURN) & !quoted_region;
-                let lfs = get_char_mask(csv_slice, LINE_FEED) & !quoted_region;
-                let mut csv_delim_mask =
-                    (get_char_mask(csv_slice, delim) | crs | lfs) & !quoted_region;
+                let mut crs = get_char_mask(csv_slice, CARRIAGE_RETURN) & !quoted_region;
+                let mut lfs = get_char_mask(csv_slice, LINE_FEED) & !quoted_region;
+                let delims = get_char_mask(csv_slice, delim) & !quoted_region;
+                let mut all_structural_chars = delims | crs | lfs;
 
-                // or to avoid branches
                 parse_error |= exists_missing_quotes(
                     quoted_region,
-                    csv_delim_mask,
+                    all_structural_chars,
                     crs,
                     lfs,
                     in_crlf,
@@ -152,18 +162,49 @@ pub mod simd_csv {
                     ended_quoted_region,
                 );
 
-                ended_delim = get_last_bit(csv_delim_mask) == 1;
+                ended_delim = get_last_bit(all_structural_chars) == 1;
 
                 // retrieve the indices of the delimiters
                 let mut shift_cnt = 0;
-                for _ in 0.._popcnt32(csv_delim_mask) {
-                    let next_idx = _tzcnt_u32(csv_delim_mask as u32) as usize;
-                    result.push(csv_idx + next_idx + shift_cnt);
-                    csv_delim_mask >>= next_idx;
-                    csv_delim_mask >>= 1;
+                for _ in 0.._popcnt32(all_structural_chars) {
+                    let next_idx = _tzcnt_u32(all_structural_chars as u32) as usize;
+                    crs >>= next_idx;
+                    lfs >>= next_idx;
+                    let quote_mask: i32 = if next_idx == 0 {
+                        0
+                    } else {
+                        ((1 << next_idx) as i32).wrapping_sub(1)
+                    };
+                    let quotes_before =
+                        (_popcnt32(quotes & quote_mask) + num_carried_quotes) as usize;
+                    let pos = csv_idx + next_idx + shift_cnt;
+                    let token_type = if crs & 1 == 1 {
+                        TokenType::CarriageReturn
+                    } else if lfs & 1 == 1 {
+                        TokenType::LineFeed
+                    } else {
+                        TokenType::Delim
+                    };
+                    result.push(Token {
+                        pos,
+                        quotes_before,
+                        token_type,
+                    });
+                    all_structural_chars >>= next_idx;
+                    all_structural_chars >>= 1;
+                    quotes >>= next_idx;
+                    quotes >>= 1;
+                    crs >>= 1;
+                    lfs >>= 1;
                     shift_cnt += next_idx + 1;
+                    num_carried_quotes = 0;
                 }
 
+                num_carried_quotes = if shift_cnt == 0 {
+                    _popcnt32(quotes)
+                } else {
+                    _popcnt32(quotes & ((1i32 << (32 - shift_cnt)).wrapping_sub(1)))
+                };
                 csv_idx += STEP;
                 in_quoted_region = end_in_quoted_region;
                 ended_quoted_region = get_last_bit(quoted_region) == 1 && end_in_quoted_region == 0;
@@ -171,7 +212,8 @@ pub mod simd_csv {
             }
         }
 
-        // Parse the remaining characters (this is at most 32)
+        // Parse the remaining characters using a DFA (this is at most 31 characters, so the
+        // branches shouldn't have too big of an impact)
         let mut parse_state = if csv_idx == 0 {
             ParseState::Start
         } else if in_quoted_region == 1 {
@@ -187,8 +229,6 @@ pub mod simd_csv {
         } else {
             ParseState::NonQuotedField
         };
-
-        dbg!(parse_state);
 
         for (idx, elem) in csv[csv_idx..].iter().enumerate() {
             match (parse_state, *elem) {
@@ -223,15 +263,34 @@ pub mod simd_csv {
                     if ch != delim && ch != LINE_FEED && ch != QUOTE => {}
                 (_, _) => return Err(ParseError::MissingQuotes),
             };
-            if parse_state == ParseState::Delim
-                || parse_state == ParseState::CarriageReturn
-                || parse_state == ParseState::LineFeed
-            {
-                result.push(csv_idx + idx);
-            }
-        }
 
-        dbg!(parse_state);
+            if *elem == QUOTE {
+                num_carried_quotes += 1;
+            }
+
+            if parse_state != ParseState::Delim
+                && parse_state != ParseState::CarriageReturn
+                && parse_state != ParseState::LineFeed
+            {
+                continue;
+            }
+
+            let token_type = if parse_state == ParseState::Delim {
+                TokenType::Delim
+            } else if parse_state == ParseState::CarriageReturn {
+                TokenType::CarriageReturn
+            } else {
+                TokenType::LineFeed
+            };
+
+            result.push(Token {
+                pos: csv_idx + idx,
+                quotes_before: num_carried_quotes as usize,
+                token_type,
+            });
+
+            num_carried_quotes = 0;
+        }
 
         if parse_error
             || parse_state == ParseState::QuotedField
@@ -240,74 +299,322 @@ pub mod simd_csv {
             return Err(ParseError::MissingQuotes);
         }
 
-        result.push(csv.len());
+        result.push(Token {
+            pos: csv.len(),
+            quotes_before: num_carried_quotes as usize,
+            token_type: TokenType::End,
+        });
 
+        Ok(result)
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    pub enum CsvItemType {
+        Field,
+        CRLF,
+    }
+
+    pub struct CsvItem<'a> {
+        span: &'a mut [u8],
+        decoded: std::cell::Cell<bool>,
+        pub item_type: CsvItemType,
+    }
+
+    impl<'a> CsvItem<'a> {
+        fn unquote(&mut self) {
+            if self.decoded.get() {
+                return;
+            }
+            let mut write_idx = 0;
+            for idx in 0..self.span.len() {
+                if self.span[idx] != QUOTE {
+                    self.span[write_idx] = self.span[idx];
+                    write_idx += 1;
+                }
+            }
+            self.decoded.set(true);
+        }
+
+        pub fn decode(&'a mut self) -> Option<&'a [u8]> {
+            self.unquote();
+            match self.item_type {
+                CsvItemType::Field => Some(self.span),
+                CsvItemType::CRLF => None,
+            }
+        }
+
+        pub fn decode_mut(&'a mut self) -> Option<&'a mut [u8]> {
+            self.unquote();
+            match self.item_type {
+                CsvItemType::Field => Some(self.span),
+                CsvItemType::CRLF => None,
+            }
+        }
+    }
+
+    pub fn extract_csv<'a>(csv: &'a mut [u8], delim: u8) -> Result<Vec<CsvItem<'a>>, ParseError> {
+        let delim_indices = decode_csv_structure(csv, delim);
+        let mut starting_idx = usize::MAX;
+        let mut result = Vec::new();
+        let mut csv = csv;
+        let mut consumed = 0;
+        for Token {
+            pos,
+            quotes_before,
+            token_type,
+        } in delim_indices?
+        {
+            starting_idx = starting_idx.wrapping_add(1);
+
+            // judging by the godbolt output, this should not compile down to a branch
+            starting_idx += if quotes_before > 0 { 1 } else { 0 };
+            let ending_idx = pos.saturating_sub(if quotes_before > 0 { 1 } else { 0 });
+
+            let (_, span) = csv.split_at_mut(starting_idx - consumed);
+            let (span, end) = span.split_at_mut(ending_idx - starting_idx);
+
+            let item_type = match token_type {
+                TokenType::LineFeed => CsvItemType::CRLF,
+                _ => CsvItemType::Field,
+            };
+
+            result.push(CsvItem {
+                span: span,
+                decoded: std::cell::Cell::new(quotes_before <= 2),
+                item_type,
+            });
+
+            consumed = ending_idx;
+            starting_idx = pos;
+            csv = end;
+        }
         Ok(result)
     }
 
     #[cfg(test)]
     mod tests {
-        use super::find_delim_indices;
+        use super::{decode_csv_structure, extract_csv, Token, TokenType};
 
         #[test]
-        fn find_delim_indices_works() {
-            let delim_indices =
-                find_delim_indices(b"asd,s,\"s\"\",\r\ns\",b,a,\r\naaaaaaaaaaaaaaa", b',').unwrap();
-            assert_eq!(delim_indices, vec![3, 5, 15, 17, 19, 20, 21, 37]);
-            let delim_indices = find_delim_indices(
-                b"0123456789ABCDEF0123456789ABCDE\r\n\
+        fn find_extract_csv_works() {
+            let mut csv = *b"a,\"b,c\", d ,e";
+            let mut extracted = extract_csv(&mut csv, b',').unwrap();
+            match extracted.as_mut_slice() {
+                [ref mut first, ref mut second, ref mut third, ref mut fourth] => {
+                    assert_eq!(first.decode().unwrap(), b"a");
+                    assert_eq!(second.decode().unwrap(), b"b,c");
+                    assert_eq!(third.decode().unwrap(), b" d ");
+                    assert_eq!(fourth.decode().unwrap(), b"e");
+                }
+                _ => panic!("Slice doesn't match"),
+            }
+        }
+
+        #[test]
+        fn decode_csv_structure_works() {
+            assert_eq!(
+                decode_csv_structure(b"asd,s,\"s\"\",\r\ns\",b,a,\r\naaaaaaaaaaaaaaa,", b',')
+                    .unwrap(),
+                vec![
+                    Token {
+                        pos: 3,
+                        quotes_before: 0,
+                        token_type: TokenType::Delim
+                    },
+                    Token {
+                        pos: 5,
+                        quotes_before: 0,
+                        token_type: TokenType::Delim
+                    },
+                    Token {
+                        pos: 15,
+                        quotes_before: 4,
+                        token_type: TokenType::Delim
+                    },
+                    Token {
+                        pos: 17,
+                        quotes_before: 0,
+                        token_type: TokenType::Delim
+                    },
+                    Token {
+                        pos: 19,
+                        quotes_before: 0,
+                        token_type: TokenType::Delim
+                    },
+                    Token {
+                        pos: 20,
+                        quotes_before: 0,
+                        token_type: TokenType::CarriageReturn
+                    },
+                    Token {
+                        pos: 21,
+                        quotes_before: 0,
+                        token_type: TokenType::LineFeed
+                    },
+                    Token {
+                        pos: 37,
+                        quotes_before: 0,
+                        token_type: TokenType::Delim
+                    },
+                    Token {
+                        pos: 38,
+                        quotes_before: 0,
+                        token_type: TokenType::End
+                    }
+                ]
+            );
+            assert_eq!(
+                decode_csv_structure(
+                    b"0123456789ABCDEF0123456789ABCDE\r\n\
                   0123456789ABCDEF0123456789ABCDEF",
-                b',',
-            )
-            .unwrap();
-            assert_eq!(delim_indices, vec![31, 32, 65]);
-            let delim_indices = find_delim_indices(
-                b"0123456789ABCDEF0123456789A,\"DE\r\n\
+                    b',',
+                )
+                .unwrap(),
+                vec![
+                    Token {
+                        pos: 31,
+                        quotes_before: 0,
+                        token_type: TokenType::CarriageReturn
+                    },
+                    Token {
+                        pos: 32,
+                        quotes_before: 0,
+                        token_type: TokenType::LineFeed
+                    },
+                    Token {
+                        pos: 65,
+                        quotes_before: 0,
+                        token_type: TokenType::End
+                    }
+                ]
+            );
+            assert_eq!(
+                decode_csv_structure(
+                    b"0123456789ABCDEF0123456789A,\"DE\r\n\
                   012\",56789ABCDEF0123456789ABCDEF",
-                b',',
-            )
-            .unwrap();
-            assert_eq!(delim_indices, vec![27, 37, 65]);
-            let delim_indices = find_delim_indices(
-                b"0123456789ABCDEF0123456789ABCD,\"\"\
+                    b',',
+                )
+                .unwrap(),
+                vec![
+                    Token {
+                        pos: 27,
+                        quotes_before: 0,
+                        token_type: TokenType::Delim
+                    },
+                    Token {
+                        pos: 37,
+                        quotes_before: 2,
+                        token_type: TokenType::Delim
+                    },
+                    Token {
+                        pos: 65,
+                        quotes_before: 0,
+                        token_type: TokenType::End
+                    }
+                ]
+            );
+            assert_eq!(
+                decode_csv_structure(
+                    b"0123456789ABCDEF0123456789ABCD,\"\"\
                   ,123456789ABCDEF0123456789ABCDEF",
-                b',',
-            )
-            .unwrap();
-            assert_eq!(delim_indices, vec![30, 33, 65]);
+                    b',',
+                )
+                .unwrap(),
+                vec![
+                    Token {
+                        pos: 30,
+                        quotes_before: 0,
+                        token_type: TokenType::Delim
+                    },
+                    Token {
+                        pos: 33,
+                        quotes_before: 2,
+                        token_type: TokenType::Delim
+                    },
+                    Token {
+                        pos: 65,
+                        quotes_before: 0,
+                        token_type: TokenType::End
+                    }
+                ]
+            );
+            assert_eq!(
+                decode_csv_structure(b"a,b,\"c,\",\r\n hi,", b',').unwrap(),
+                vec![
+                    Token {
+                        pos: 1,
+                        quotes_before: 0,
+                        token_type: TokenType::Delim
+                    },
+                    Token {
+                        pos: 3,
+                        quotes_before: 0,
+                        token_type: TokenType::Delim
+                    },
+                    Token {
+                        pos: 8,
+                        quotes_before: 2,
+                        token_type: TokenType::Delim
+                    },
+                    Token {
+                        pos: 9,
+                        quotes_before: 0,
+                        token_type: TokenType::CarriageReturn
+                    },
+                    Token {
+                        pos: 10,
+                        quotes_before: 0,
+                        token_type: TokenType::LineFeed
+                    },
+                    Token {
+                        pos: 14,
+                        quotes_before: 0,
+                        token_type: TokenType::Delim
+                    },
+                    Token {
+                        pos: 15,
+                        quotes_before: 0,
+                        token_type: TokenType::End
+                    }
+                ]
+            );
         }
 
         #[test]
         fn err_on_missing_quotes() {
+            assert!(decode_csv_structure(b" \"missing\", a", b',').is_err());
+            assert!(decode_csv_structure(b"helllo,\"mis", b',').is_err());
+            assert!(decode_csv_structure(b"he\nlllo,\"mis\"", b',').is_err());
             assert!(
-                find_delim_indices(b"hello,world, \"missing\", aaaaaaaaaaaaaaaaa", b',').is_err()
+                decode_csv_structure(b"hello,world, \"missing\", aaaaaaaaaaaaaaaaa", b',').is_err()
             );
             assert!(
-                find_delim_indices(b"hello,world,\"missing\" , aaaaaaaaaaaaaaaaa", b',').is_err()
+                decode_csv_structure(b"hello,world,\"missing\" , aaaaaaaaaaaaaaaaa", b',').is_err()
             );
             assert!(
-                find_delim_indices(b"hello,world,\"missing\",\"aaaaaaaaaaaaaaaaa", b',').is_err()
+                decode_csv_structure(b"hello,world,\"missing\",\"aaaaaaaaaaaaaaaaa", b',').is_err()
             );
             assert!(
-                find_delim_indices(b"hello,wor\rld,\"missing\",aaaaaaaaaaaaaaaaa", b',').is_err()
+                decode_csv_structure(b"hello,wor\rld,\"missing\",aaaaaaaaaaaaaaaaa", b',').is_err()
             );
             assert!(
-                find_delim_indices(b"hello,wor\nld,\"missing\",aaaaaaaaaaaaaaaaa", b',').is_err()
+                decode_csv_structure(b"hello,wor\nld,\"missing\",aaaaaaaaaaaaaaaaa", b',').is_err()
             );
             assert!(
-                find_delim_indices(b"hello,wor\n\rld,\"missing\",aaaaaaaaaaaaaaaaa", b',').is_err()
+                decode_csv_structure(b"hello,wor\n\rld,\"missing\",aaaaaaaaaaaaaaaaa", b',')
+                    .is_err()
             );
-            assert!(find_delim_indices(
+            assert!(decode_csv_structure(
                 b"0123456789ABCDEF0123456789ABCD,\"\" ,123456789ABCDEF0123456789ABCDEF",
                 b',',
             )
             .is_err());
-            assert!(find_delim_indices(
+            assert!(decode_csv_structure(
                 b"0123456789ABCDEF0123456789ABCD,\" \" ,123456789ABCDEF0123456789ABCDEF",
                 b',',
             )
             .is_err());
-            assert!(find_delim_indices(
+            assert!(decode_csv_structure(
                 b"0123456789ABCDEF0123456789ABCD,\"\"\"\" ,123456789ABCDEF0123456789ABCDEF",
                 b',',
             )
