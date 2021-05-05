@@ -316,6 +316,7 @@ pub mod simd_csv {
 
     pub struct CsvItem<'a> {
         span: &'a mut [u8],
+        length: usize,
         decoded: std::cell::Cell<bool>,
         pub item_type: CsvItemType,
     }
@@ -326,19 +327,26 @@ pub mod simd_csv {
                 return;
             }
             let mut write_idx = 0;
+            let mut num_quotes = 0;
             for idx in 0..self.span.len() {
-                if self.span[idx] != QUOTE {
-                    self.span[write_idx] = self.span[idx];
-                    write_idx += 1;
+                if self.span[idx] == QUOTE {
+                    num_quotes += 1;
                 }
+                if num_quotes == 2 {
+                    num_quotes = 0;
+                    continue;
+                }
+                self.span[write_idx] = self.span[idx];
+                write_idx += 1;
             }
+            self.length = write_idx;
             self.decoded.set(true);
         }
 
         pub fn decode(&'a mut self) -> Option<&'a [u8]> {
             self.unquote();
             match self.item_type {
-                CsvItemType::Field => Some(self.span),
+                CsvItemType::Field => Some(&self.span[0..self.length]),
                 CsvItemType::CRLF => None,
             }
         }
@@ -346,7 +354,7 @@ pub mod simd_csv {
         pub fn decode_mut(&'a mut self) -> Option<&'a mut [u8]> {
             self.unquote();
             match self.item_type {
-                CsvItemType::Field => Some(self.span),
+                CsvItemType::Field => Some(&mut self.span[0..self.length]),
                 CsvItemType::CRLF => None,
             }
         }
@@ -378,8 +386,11 @@ pub mod simd_csv {
                 _ => CsvItemType::Field,
             };
 
+            let length = span.len();
+
             result.push(CsvItem {
-                span: span,
+                span,
+                length,
                 decoded: std::cell::Cell::new(quotes_before <= 2),
                 item_type,
             });
@@ -397,14 +408,15 @@ pub mod simd_csv {
 
         #[test]
         fn find_extract_csv_works() {
-            let mut csv = *b"a,\"b,c\", d ,e";
+            let mut csv = *b"a,\"b\"\",c\", d ,e,";
             let mut extracted = extract_csv(&mut csv, b',').unwrap();
             match extracted.as_mut_slice() {
-                [ref mut first, ref mut second, ref mut third, ref mut fourth] => {
+                [ref mut first, ref mut second, ref mut third, ref mut fourth, ref mut fifth] => {
                     assert_eq!(first.decode().unwrap(), b"a");
-                    assert_eq!(second.decode().unwrap(), b"b,c");
+                    assert_eq!(second.decode().unwrap(), b"b\",c");
                     assert_eq!(third.decode().unwrap(), b" d ");
                     assert_eq!(fourth.decode().unwrap(), b"e");
+                    assert_eq!(fifth.decode().unwrap(), b"");
                 }
                 _ => panic!("Slice doesn't match"),
             }
