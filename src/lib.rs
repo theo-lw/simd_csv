@@ -317,13 +317,13 @@ pub mod simd_csv {
     pub struct CsvItem<'a> {
         span: &'a mut [u8],
         length: usize,
-        decoded: std::cell::Cell<bool>,
+        decoded: bool,
         pub item_type: CsvItemType,
     }
 
     impl<'a> CsvItem<'a> {
         fn unquote(&mut self) {
-            if self.decoded.get() {
+            if self.decoded {
                 return;
             }
             let mut write_idx = 0;
@@ -340,7 +340,7 @@ pub mod simd_csv {
                 write_idx += 1;
             }
             self.length = write_idx;
-            self.decoded.set(true);
+            self.decoded = true;
         }
 
         pub fn decode(&'a mut self) -> Option<&'a [u8]> {
@@ -391,7 +391,7 @@ pub mod simd_csv {
             result.push(CsvItem {
                 span,
                 length,
-                decoded: std::cell::Cell::new(quotes_before <= 2),
+                decoded: quotes_before <= 2,
                 item_type,
             });
 
