@@ -7,9 +7,11 @@ An attempt at creating a very fast CSV ([RFC 4180](https://tools.ietf.org/html/r
 
 This library has yet to go through real-world benchmarks & testing. However, microbenchmarks show some promise:
 
+```
 csv parsing/simd csv    time:   [331.27 us 332.94 us 335.21 us]
-
 csv parsing/csv         time:   [715.39 us 718.07 us 721.26 us]
+```
+
 
 ## TODO
 
